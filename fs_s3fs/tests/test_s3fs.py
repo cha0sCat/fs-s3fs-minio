@@ -2,50 +2,74 @@ from __future__ import unicode_literals
 
 import unittest
 
+import minio
 from nose.plugins.attrib import attr
 
 from fs.test import FSTestCases
 from fs_s3fs import S3FS
 
-import boto3
-
 
 class TestS3FS(FSTestCases, unittest.TestCase):
     """Test S3FS implementation from dir_path."""
 
-    bucket_name = "fsexample"
-    s3 = boto3.resource("s3")
-    client = boto3.client("s3")
+    bucket_name = "fs-minio-test"
+    client = minio.Minio(
+        endpoint="localhost:9000",
+        region="us-west-2",
+        access_key="minio",
+        secret_key="minio123",
+        secure=False
+    )
 
     def make_fs(self):
         self._delete_bucket_contents()
-        return S3FS(self.bucket_name)
+        return S3FS(
+            self.bucket_name,
+            region="us-west-2",
+            access_key="minio",
+            secret_key="minio123",
+            endpoint="localhost:9000",
+        )
 
     def _delete_bucket_contents(self):
-        response = self.client.list_objects(Bucket=self.bucket_name)
-        contents = response.get("Contents", ())
-        for obj in contents:
-            self.client.delete_object(Bucket=self.bucket_name, Key=obj["Key"])
+        for exist_object in self.client.list_objects(self.bucket_name, recursive=True):
+            self.client.remove_object(exist_object.bucket_name, exist_object.object_name)
 
 
 @attr("slow")
 class TestS3FSSubDir(FSTestCases, unittest.TestCase):
     """Test S3FS implementation from dir_path."""
 
-    bucket_name = "fsexample"
-    s3 = boto3.resource("s3")
-    client = boto3.client("s3")
+    bucket_name = "fs-minio-test"
+    client = minio.Minio(
+        endpoint="localhost:9000",
+        region="us-west-2",
+        access_key="minio",
+        secret_key="minio123",
+        secure=False
+    )
+    s3 = S3FS(
+        bucket_name,
+        region="us-west-2",
+        access_key="minio",
+        secret_key="minio123",
+        endpoint="localhost:9000",
+    )
 
     def make_fs(self):
         self._delete_bucket_contents()
-        self.s3.Object(self.bucket_name, "subdirectory").put()
-        return S3FS(self.bucket_name, dir_path="subdirectory")
+        self.s3.makedir("subdirectory", recreate=True)
+        return S3FS(
+            self.bucket_name, dir_path="subdirectory",
+            region="us-west-2",
+            access_key="minio",
+            secret_key="minio123",
+            endpoint="localhost:9000",
+        )
 
     def _delete_bucket_contents(self):
-        response = self.client.list_objects(Bucket=self.bucket_name)
-        contents = response.get("Contents", ())
-        for obj in contents:
-            self.client.delete_object(Bucket=self.bucket_name, Key=obj["Key"])
+        for exist_object in self.client.list_objects(self.bucket_name, recursive=True):
+            self.client.remove_object(exist_object.bucket_name, exist_object.object_name)
 
 
 class TestS3FSHelpers(unittest.TestCase):

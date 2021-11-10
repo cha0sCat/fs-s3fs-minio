@@ -5,17 +5,19 @@ from __future__ import unicode_literals
 __all__ = ["S3FS"]
 
 import contextlib
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import itertools
 import os
-from ssl import SSLError
 import tempfile
 import threading
 import mimetypes
 
-import boto3
-from botocore.exceptions import ClientError, EndpointConnectionError
+import minio
+from minio import S3Error
+from minio.datatypes import (
+    Object as minioObject
+)
 
 import six
 from six import text_type
@@ -25,7 +27,6 @@ from fs.base import FS
 from fs.info import Info
 from fs import errors
 from fs.mode import Mode
-from fs.subfs import SubFS
 from fs.path import basename, dirname, forcedir, join, normpath, relpath
 from fs.time import datetime_to_epoch
 
@@ -151,7 +152,7 @@ class S3File(io.IOBase):
         return self._f.readall()
 
     def readinto(self, b):
-        return self._f.readinto()
+        return self._f.readinto(b)
 
     def write(self, b):
         if not self.__mode.writing:
@@ -165,18 +166,29 @@ class S3File(io.IOBase):
         self._f.truncate(size)
         return size
 
+    @property
+    def length(self):
+        current_offset = self.tell()
+        self.seek(0, os.SEEK_END)
+        length = self.tell()
+        self.seek(current_offset, os.SEEK_SET)
+        return length
+
+    @property
+    def mode(self):
+        return self.__mode
+
 
 @contextlib.contextmanager
-def s3errors(path):
+def minioerrors(path):
     """Translate S3 errors to FSErrors."""
     try:
         yield
-    except ClientError as error:
-        _error = error.response.get("Error", {})
-        error_code = _error.get("Code", None)
-        response_meta = error.response.get("ResponseMetadata", {})
-        http_status = response_meta.get("HTTPStatusCode", 200)
-        error_msg = _error.get("Message", None)
+    except S3Error as error:
+        error_code = error.code
+        error_msg = error.message
+        http_status = error.response.status
+
         if error_code == "NoSuchBucket":
             raise errors.ResourceError(path, exc=error, msg=error_msg)
         if http_status == 404:
@@ -185,10 +197,6 @@ def s3errors(path):
             raise errors.PermissionDenied(path=path, msg=error_msg)
         else:
             raise errors.OperationFailed(path=path, exc=error)
-    except SSLError as error:
-        raise errors.OperationFailed(path, exc=error)
-    except EndpointConnectionError as error:
-        raise errors.RemoteConnectionError(path, exc=error, msg="{}".format(error))
 
 
 @six.python_2_unicode_compatible
@@ -235,74 +243,68 @@ class S3FS(FS):
     }
 
     _object_attributes = [
-        "accept_ranges",
-        "cache_control",
-        "content_disposition",
-        "content_encoding",
-        "content_language",
-        "content_length",
+        # all public attrs in minio.datatypes.Object
+        "bucket_name",
         "content_type",
-        "delete_marker",
-        "e_tag",
-        "expiration",
-        "expires",
+        "etag",
+        "is_delete_marker",
+        "is_dir",
+        "is_latest",
         "last_modified",
         "metadata",
-        "missing_meta",
-        "parts_count",
-        "replication_status",
-        "request_charged",
-        "restore",
-        "server_side_encryption",
-        "sse_customer_algorithm",
-        "sse_customer_key_md5",
-        "ssekms_key_id",
+        "object_name",
+        "owner_id",
+        "owner_name",
+        "size",
         "storage_class",
-        "version_id",
-        "website_redirect_location",
+        "version_id"
     ]
 
+    _dir_mark = ".pyfs.isdir"
+
     def __init__(
-        self,
-        bucket_name,
-        dir_path="/",
-        aws_access_key_id=None,
-        aws_secret_access_key=None,
-        aws_session_token=None,
-        endpoint_url=None,
-        region=None,
-        delimiter="/",
-        strict=True,
-        cache_control=None,
-        acl=None,
-        upload_args=None,
-        download_args=None,
+            self,
+            bucket_name,
+            dir_path="/",
+            endpoint=None,
+            access_key=None,
+            secret_key=None,
+            secure=False,
+            region=None,
+            http_client=None,
+            delimiter="/",
+            strict=True,
+            upload_args=None,
+            download_args=None,
     ):
-        _creds = (aws_access_key_id, aws_secret_access_key)
+        if download_args is None:
+            self._download_args = {"request_headers": None}
+        if upload_args is None:
+            self._upload_args = {"content_type": None, "metadata": None}
+
+        _creds = (access_key, secret_key)
         if any(_creds) and not all(_creds):
             raise ValueError(
-                "aws_access_key_id and aws_secret_access_key "
+                "access_key and secret_key "
                 "must be set together if specified"
             )
         self._bucket_name = bucket_name
+        self.bucket_name = bucket_name
         self.dir_path = dir_path
         self._prefix = relpath(normpath(dir_path)).rstrip("/")
-        self.aws_access_key_id = aws_access_key_id
-        self.aws_secret_access_key = aws_secret_access_key
-        self.aws_session_token = aws_session_token
-        self.endpoint_url = endpoint_url
+
+        # minioClient required
+        self.endpoint = endpoint
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.secure = secure
         self.region = region
+        self.http_client = http_client
+
         self.delimiter = delimiter
         self.strict = strict
         self._tlocal = threading.local()
-        if cache_control or acl:
-            upload_args = upload_args or {}
-            if cache_control:
-                upload_args["CacheControl"] = cache_control
-            if acl:
-                upload_args["ACL"] = acl
-        self.upload_args = upload_args
-        self.download_args = download_args
+
         super(S3FS, self).__init__()
 
     def __repr__(self):
@@ -315,9 +317,9 @@ class S3FS(FS):
         )
 
     def __str__(self):
-        return "<s3fs '{}'>".format(join(self._bucket_name, relpath(self.dir_path)))
+        return "<miniofs '{}'>".format(join(self._bucket_name, relpath(self.dir_path)))
 
-    def _path_to_key(self, path):
+    def _path_to_key(self, path) -> str:
         """Converts an fs path to a s3 key."""
         _path = relpath(normpath(path))
         _key = (
@@ -325,83 +327,72 @@ class S3FS(FS):
         )
         return _key
 
-    def _path_to_dir_key(self, path):
+    def _path_to_dir_key(self, path) -> str:
         """Converts an fs path to a s3 key."""
         _path = relpath(normpath(path))
         _key = (
             forcedir("{}/{}".format(self._prefix, _path))
-            .lstrip("/")
-            .replace("/", self.delimiter)
+                .lstrip("/")
+                .replace("/", self.delimiter)
         )
         return _key
 
-    def _key_to_path(self, key):
+    def _key_to_path(self, key) -> str:
         return key.replace(self.delimiter, "/")
 
-    def _get_object(self, path, key):
+    def _minio_stat_object(self, path, key) -> minioObject:
         _key = key.rstrip(self.delimiter)
-        try:
-            with s3errors(path):
-                obj = self.s3.Object(self._bucket_name, _key)
-                obj.load()
-        except errors.ResourceNotFound:
-            with s3errors(path):
-                obj = self.s3.Object(self._bucket_name, _key + self.delimiter)
-                obj.load()
-                return obj
-        else:
-            return obj
+        with minioerrors(path):
+            try:
+                return self.minio.stat_object(
+                    self.bucket_name,
+                    _key,
+                )
+            except S3Error:
+                current_dir = list(filter(lambda x: x.object_name.rstrip(self.delimiter) == _key, self.minio.list_objects(self.bucket_name, _key)))
+                if not current_dir:
+                    raise errors.ResourceNotFound(path)
+                return current_dir[0]
 
-    def _get_upload_args(self, key):
-        upload_args = self.upload_args.copy() if self.upload_args else {}
-        if "ContentType" not in upload_args:
+
+    def _get_upload_args(self, key) -> dict:
+        upload_args = self._upload_args.copy()
+
+        if not upload_args.get("content_type"):
             mime_type, _encoding = mimetypes.guess_type(key)
-            if six.PY2 and mime_type is not None:
-                mime_type = mime_type.decode("utf-8", "replace")
-            upload_args["ContentType"] = mime_type or "binary/octet-stream"
+            upload_args["content_type"] = mime_type or "binary/octet-stream"
+
         return upload_args
 
     @property
-    def s3(self):
-        if not hasattr(self._tlocal, "s3"):
-            self._tlocal.s3 = boto3.resource(
-                "s3",
-                region_name=self.region,
-                aws_access_key_id=self.aws_access_key_id,
-                aws_secret_access_key=self.aws_secret_access_key,
-                aws_session_token=self.aws_session_token,
-                endpoint_url=self.endpoint_url,
+    def minio(self) -> minio.Minio:
+        if not hasattr(self._tlocal, "minio"):
+            self._tlocal.minio = minio.Minio(
+                self.endpoint,
+                access_key=self.access_key,
+                secret_key=self.secret_key,
+                secure=self.secure,
+                http_client=self.http_client,
             )
-        return self._tlocal.s3
+        return self._tlocal.minio
 
-    @property
-    def client(self):
-        if not hasattr(self._tlocal, "client"):
-            self._tlocal.client = boto3.client(
-                "s3",
-                region_name=self.region,
-                aws_access_key_id=self.aws_access_key_id,
-                aws_secret_access_key=self.aws_secret_access_key,
-                aws_session_token=self.aws_session_token,
-                endpoint_url=self.endpoint_url,
-            )
-        return self._tlocal.client
-
-    def _info_from_object(self, obj, namespaces):
+    def _extract_info_from_minio_object(self, obj: minioObject, namespaces) -> dict:
         """Make an info dict from an s3 Object."""
-        key = obj.key
-        path = self._key_to_path(key)
-        name = basename(path.rstrip("/"))
-        is_dir = key.endswith(self.delimiter)
+        key = obj.object_name  # 'a/b/c/d'
+        path = self._key_to_path(key)  # noting happen
+        name = basename(path.rstrip("/"))  # 'd'
+        is_dir = obj.is_dir
         info = {"basic": {"name": name, "is_dir": is_dir}}
+
         if "details" in namespaces:
             _type = int(ResourceType.directory if is_dir else ResourceType.file)
             info["details"] = {
                 "accessed": None,
-                "modified": datetime_to_epoch(obj.last_modified),
-                "size": obj.content_length,
+                "modified": datetime_to_epoch(obj.last_modified) if obj.last_modified else None,
+                "size": obj.size,
                 "type": _type,
             }
+
         if "s3" in namespaces:
             s3info = info["s3"] = {}
             for name in self._object_attributes:
@@ -409,36 +400,13 @@ class S3FS(FS):
                 if isinstance(value, datetime):
                     value = datetime_to_epoch(value)
                 s3info[name] = value
-        if "urls" in namespaces:
-            url = self.client.generate_presigned_url(
-                ClientMethod="get_object",
-                Params={"Bucket": self._bucket_name, "Key": key},
-            )
-            info["urls"] = {"download": url}
+
         return info
 
-    def isdir(self, path):
-        _path = self.validatepath(path)
-        try:
-            return self._getinfo(_path).is_dir
-        except errors.ResourceNotFound:
-            return False
-
-    def getinfo(self, path, namespaces=None):
-        self.check()
+    def getinfo(self, path, namespaces=None) -> Info:
         namespaces = namespaces or ()
         _path = self.validatepath(path)
         _key = self._path_to_key(_path)
-
-        try:
-            dir_path = dirname(_path)
-            if dir_path != "/":
-                _dir_key = self._path_to_dir_key(dir_path)
-                with s3errors(path):
-                    obj = self.s3.Object(self._bucket_name, _dir_key)
-                    obj.load()
-        except errors.ResourceNotFound:
-            raise errors.ResourceNotFound(path)
 
         if _path == "/":
             return Info(
@@ -448,84 +416,91 @@ class S3FS(FS):
                 }
             )
 
-        obj = self._get_object(path, _key)
-        info = self._info_from_object(obj, namespaces)
+        obj = self._minio_stat_object(path, _key)
+        info = self._extract_info_from_minio_object(obj, namespaces)
         return Info(info)
 
-    def _getinfo(self, path, namespaces=None):
-        """Gets info without checking for parent dir."""
-        namespaces = namespaces or ()
-        _path = self.validatepath(path)
-        _key = self._path_to_key(_path)
-        if _path == "/":
-            return Info(
-                {
-                    "basic": {"name": "", "is_dir": True},
-                    "details": {"type": int(ResourceType.directory)},
-                }
-            )
-
-        obj = self._get_object(path, _key)
-        info = self._info_from_object(obj, namespaces)
-        return Info(info)
-
-    def listdir(self, path):
+    def listdir(self, path) -> list:
         _path = self.validatepath(path)
         _s3_key = self._path_to_dir_key(_path)
-        prefix_len = len(_s3_key)
 
-        paginator = self.client.get_paginator("list_objects")
-        with s3errors(path):
-            _paginate = paginator.paginate(
-                Bucket=self._bucket_name, Prefix=_s3_key, Delimiter=self.delimiter
-            )
-            _directory = []
-            for result in _paginate:
-                common_prefixes = result.get("CommonPrefixes", ())
-                for prefix in common_prefixes:
-                    _prefix = prefix.get("Prefix")
-                    _name = _prefix[prefix_len:]
-                    if _name:
-                        _directory.append(_name.rstrip(self.delimiter))
-                for obj in result.get("Contents", ()):
-                    name = obj["Key"][prefix_len:]
-                    if name:
-                        _directory.append(name)
+        dirs = []
+        with minioerrors(path):
+            objects_list = list(self.minio.list_objects(
+                self.bucket_name,
+                prefix=_s3_key,
+                recursive=False,
+            ))
+            if not objects_list and _s3_key != "":
+                if self.getinfo(path).is_file:
+                    raise errors.DirectoryExpected(path)
+                raise errors.ResourceNotFound(path)
+            for obj in objects_list:
+                if obj.object_name.endswith(self._dir_mark):
+                    continue
+                key = basename(obj.object_name.rstrip("/"))
 
-        if not _directory:
-            if not self.getinfo(_path).is_dir:
-                raise errors.DirectoryExpected(path)
+                dirs.append(key)
 
-        return _directory
+        if len(dirs) == 1 and not self.getinfo(path).is_dir:
+            raise NotADirectoryError(path)
+
+        return dirs
 
     def makedir(self, path, permissions=None, recreate=False):
         self.check()
         _path = self.validatepath(path)
         _key = self._path_to_dir_key(_path)
 
+        # 检查父文件夹是否存在
         if not self.isdir(dirname(_path)):
             raise errors.ResourceNotFound(path)
 
-        try:
-            self._getinfo(path)
-        except errors.ResourceNotFound:
-            pass
+        file_mark = join(_key, self._dir_mark)  # 在目录下创建一个 mark 文件，表示目录被生成
+
+        # 标记文件已存在
+        if not recreate and (self.exists(file_mark) or self.exists(path)):
+            raise errors.DirectoryExists(path)
+
         else:
-            if recreate:
-                return self.opendir(_path)
-            else:
-                raise errors.DirectoryExists(path)
-        with s3errors(path):
-            _obj = self.s3.Object(self._bucket_name, _key)
-            _obj.put(**self._get_upload_args(_key))
-        return SubFS(self, path)
+            with minioerrors(path):
+                self.minio.put_object(
+                    self.bucket_name,
+                    file_mark,
+                    io.BytesIO(b""),
+                    length=0,
+                )
+
+        return self.opendir(path)
 
     def openbin(self, path, mode="r", buffering=-1, **options):
+        mode = mode if "b" in mode else mode + "b"
         _mode = Mode(mode)
         _mode.validate_bin()
         self.check()
         _path = self.validatepath(path)
         _key = self._path_to_key(_path)
+        #
+        # if _mode.create:
+        #     # check ancestor exist
+        #     _ancestor_path = dirname(_path)
+        #     if _ancestor_path != "/":
+        #         _ancestor_key = self._path_to_dir_key(_ancestor_path)
+        #         self._minio_stat_object(_ancestor_path, _ancestor_key)
+        #
+        #     # only do if file exist
+        #     try:
+        #         info = self.getinfo(path)
+        #     except errors.ResourceNotFound:
+        #         pass
+        #     else:
+        #         # check file exist if in exclusive mode
+        #         if _mode.exclusive:
+        #             raise errors.FileExists(path)
+        #
+        #         # check already have same name dir
+        #         if info.isdir:
+        #             raise errors.FileExists(path)
 
         if _mode.create:
 
@@ -533,12 +508,13 @@ class S3FS(FS):
                 """Called when the S3 file closes, to upload data."""
                 try:
                     s3file.raw.seek(0)
-                    with s3errors(path):
-                        self.client.upload_fileobj(
-                            s3file.raw,
+                    with minioerrors(path):
+                        self.minio.put_object(
                             self._bucket_name,
                             _key,
-                            ExtraArgs=self._get_upload_args(_key),
+                            s3file.raw,
+                            s3file.length,
+                            **self._get_upload_args(_key)
                         )
                 finally:
                     s3file.raw.close()
@@ -547,12 +523,12 @@ class S3FS(FS):
                 dir_path = dirname(_path)
                 if dir_path != "/":
                     _dir_key = self._path_to_dir_key(dir_path)
-                    self._get_object(dir_path, _dir_key)
+                    self._minio_stat_object(dir_path, _dir_key)
             except errors.ResourceNotFound:
                 raise errors.ResourceNotFound(path)
 
             try:
-                info = self._getinfo(path)
+                info = self.getinfo(path)
             except errors.ResourceNotFound:
                 pass
             else:
@@ -564,13 +540,12 @@ class S3FS(FS):
             s3file = S3File.factory(path, _mode, on_close=on_close_create)
             if _mode.appending:
                 try:
-                    with s3errors(path):
-                        self.client.download_fileobj(
+                    with minioerrors(path):
+                        s3file.raw.write(self.minio.get_object(
                             self._bucket_name,
                             _key,
-                            s3file.raw,
-                            ExtraArgs=self.download_args,
-                        )
+                            **self._download_args
+                        ).read())
                 except errors.ResourceNotFound:
                     pass
                 else:
@@ -588,21 +563,24 @@ class S3FS(FS):
             try:
                 if _mode.writing:
                     s3file.raw.seek(0, os.SEEK_SET)
-                    with s3errors(path):
-                        self.client.upload_fileobj(
-                            s3file.raw,
+                    with minioerrors(path):
+                        self.minio.put_object(
                             self._bucket_name,
                             _key,
-                            ExtraArgs=self._get_upload_args(_key),
+                            s3file.raw,
+                            s3file.length,
+                            **self._get_upload_args(_key)
                         )
             finally:
                 s3file.raw.close()
 
         s3file = S3File.factory(path, _mode, on_close=on_close)
-        with s3errors(path):
-            self.client.download_fileobj(
-                self._bucket_name, _key, s3file.raw, ExtraArgs=self.download_args
-            )
+        with minioerrors(path):
+            s3file.raw.write(self.minio.get_object(
+                self._bucket_name,
+                _key,
+                **self._download_args
+            ).read())
         s3file.seek(0, os.SEEK_SET)
         return s3file
 
@@ -614,20 +592,13 @@ class S3FS(FS):
             info = self.getinfo(path)
             if info.is_dir:
                 raise errors.FileExpected(path)
-        self.client.delete_object(Bucket=self._bucket_name, Key=_key)
+        self.minio.remove_object(self._bucket_name, _key)
 
     def isempty(self, path):
         self.check()
         _path = self.validatepath(path)
         _key = self._path_to_dir_key(_path)
-        response = self.client.list_objects(
-            Bucket=self._bucket_name, Prefix=_key, MaxKeys=2
-        )
-        contents = response.get("Contents", ())
-        for obj in contents:
-            if obj["Key"] != _key:
-                return False
-        return True
+        return self.listdir(path) == []
 
     def removedir(self, path):
         self.check()
@@ -640,7 +611,7 @@ class S3FS(FS):
         if not self.isempty(path):
             raise errors.DirectoryNotEmpty(path)
         _key = self._path_to_dir_key(_path)
-        self.client.delete_object(Bucket=self._bucket_name, Key=_key)
+        self.minio.remove_object(self._bucket_name, join(_key, self._dir_mark))
 
     def setinfo(self, path, info):
         self.getinfo(path)
@@ -654,10 +625,12 @@ class S3FS(FS):
         _path = self.validatepath(path)
         _key = self._path_to_key(_path)
         bytes_file = io.BytesIO()
-        with s3errors(path):
-            self.client.download_fileobj(
-                self._bucket_name, _key, bytes_file, ExtraArgs=self.download_args
-            )
+        with minioerrors(path):
+            bytes_file.write(self.minio.get_object(
+                self._bucket_name,
+                _key,
+                **self._download_args
+            ).read())
         return bytes_file.getvalue()
 
     def download(self, path, file, chunk_size=None, **options):
@@ -668,10 +641,12 @@ class S3FS(FS):
                 raise errors.FileExpected(path)
         _path = self.validatepath(path)
         _key = self._path_to_key(_path)
-        with s3errors(path):
-            self.client.download_fileobj(
-                self._bucket_name, _key, file, ExtraArgs=self.download_args
-            )
+        with minioerrors(path):
+            file.write(self.minio.get_object(
+                self._bucket_name,
+                _key,
+                **self._download_args
+            ).read())
 
     def exists(self, path):
         self.check()
@@ -680,7 +655,7 @@ class S3FS(FS):
             return True
         _key = self._path_to_dir_key(_path)
         try:
-            self._get_object(path, _key)
+            self._minio_stat_object(path, _key)
         except errors.ResourceNotFound:
             return False
         else:
@@ -690,38 +665,21 @@ class S3FS(FS):
         _path = self.validatepath(path)
         namespaces = namespaces or ()
         _s3_key = self._path_to_dir_key(_path)
-        prefix_len = len(_s3_key)
 
         info = self.getinfo(path)
         if not info.is_dir:
             raise errors.DirectoryExpected(path)
 
-        paginator = self.client.get_paginator("list_objects")
-        _paginate = paginator.paginate(
-            Bucket=self._bucket_name, Prefix=_s3_key, Delimiter=self.delimiter
-        )
-
         def gen_info():
-            for result in _paginate:
-                common_prefixes = result.get("CommonPrefixes", ())
-                for prefix in common_prefixes:
-                    _prefix = prefix.get("Prefix")
-                    _name = _prefix[prefix_len:]
-                    if _name:
-                        info = {
-                            "basic": {
-                                "name": _name.rstrip(self.delimiter),
-                                "is_dir": True,
-                            }
-                        }
-                        yield Info(info)
-                for _obj in result.get("Contents", ()):
-                    name = _obj["Key"][prefix_len:]
-                    if name:
-                        with s3errors(path):
-                            obj = self.s3.Object(self._bucket_name, _obj["Key"])
-                        info = self._info_from_object(obj, namespaces)
-                        yield Info(info)
+            with minioerrors(path):
+                for obj in self.minio.list_objects(
+                        self.bucket_name,
+                        prefix=_s3_key,
+                        recursive=False,
+                ):
+                    if obj.object_name.endswith(self._dir_mark):
+                        continue
+                    yield Info(self._extract_info_from_minio_object(obj, namespaces))
 
         iter_info = iter(gen_info())
         if page is not None:
@@ -741,75 +699,81 @@ class S3FS(FS):
             if not self.isdir(dirname(path)):
                 raise errors.ResourceNotFound(path)
             try:
-                info = self._getinfo(path)
+                info = self.getinfo(path)
                 if info.is_dir:
                     raise errors.FileExpected(path)
             except errors.ResourceNotFound:
                 pass
 
         bytes_file = io.BytesIO(contents)
-        with s3errors(path):
-            self.client.upload_fileobj(
-                bytes_file,
+        with minioerrors(path):
+            self.minio.put_object(
                 self._bucket_name,
                 _key,
-                ExtraArgs=self._get_upload_args(_key),
+                bytes_file,
+                len(contents),
+                **self._get_upload_args(_key)
             )
 
-    def upload(self, path, file, chunk_size=None, **options):
-        _path = self.validatepath(path)
-        _key = self._path_to_key(_path)
+    # def upload(self, path, file, chunk_size=None, **options):
+    #     _path = self.validatepath(path)
+    #     _key = self._path_to_key(_path)
+    #
+    #     if self.strict:
+    #         if not self.isdir(dirname(path)):
+    #             raise errors.ResourceNotFound(path)
+    #         try:
+    #             info = self._getinfo(path)
+    #             if info.is_dir:
+    #                 raise errors.FileExpected(path)
+    #         except errors.ResourceNotFound:
+    #             pass
+    #
+    #     with minioerrors(path):
+    #         self.minio.put_object(
+    #             self._bucket_name,
+    #             _key,
+    #             file,
+    #             file.
+    #             **self._get_upload_args(_key)
+    #         )
 
-        if self.strict:
-            if not self.isdir(dirname(path)):
-                raise errors.ResourceNotFound(path)
-            try:
-                info = self._getinfo(path)
-                if info.is_dir:
-                    raise errors.FileExpected(path)
-            except errors.ResourceNotFound:
-                pass
+    # def copy(self, src_path, dst_path, overwrite=False):
+    #     if not overwrite and self.exists(dst_path):
+    #         raise errors.DestinationExists(dst_path)
+    #     _src_path = self.validatepath(src_path)
+    #     _dst_path = self.validatepath(dst_path)
+    #     if self.strict:
+    #         if not self.isdir(dirname(_dst_path)):
+    #             raise errors.ResourceNotFound(dst_path)
+    #     _src_key = self._path_to_key(_src_path)
+    #     _dst_key = self._path_to_key(_dst_path)
+    #     try:
+    #         with s3errors(src_path):
+    #             self.client.copy_object(
+    #                 Bucket=self._bucket_name,
+    #                 Key=_dst_key,
+    #                 CopySource={"Bucket": self._bucket_name, "Key": _src_key},
+    #             )
+    #     except errors.ResourceNotFound:
+    #         if self.exists(src_path):
+    #             raise errors.FileExpected(src_path)
+    #         raise
 
-        with s3errors(path):
-            self.client.upload_fileobj(
-                file, self._bucket_name, _key, ExtraArgs=self._get_upload_args(_key)
-            )
+    # def move(self, src_path, dst_path, overwrite=False):
+    #     self.copy(src_path, dst_path, overwrite=overwrite)
+    #     self.remove(src_path)
 
-    def copy(self, src_path, dst_path, overwrite=False):
-        if not overwrite and self.exists(dst_path):
-            raise errors.DestinationExists(dst_path)
-        _src_path = self.validatepath(src_path)
-        _dst_path = self.validatepath(dst_path)
-        if self.strict:
-            if not self.isdir(dirname(_dst_path)):
-                raise errors.ResourceNotFound(dst_path)
-        _src_key = self._path_to_key(_src_path)
-        _dst_key = self._path_to_key(_dst_path)
-        try:
-            with s3errors(src_path):
-                self.client.copy_object(
-                    Bucket=self._bucket_name,
-                    Key=_dst_key,
-                    CopySource={"Bucket": self._bucket_name, "Key": _src_key},
-                )
-        except errors.ResourceNotFound:
-            if self.exists(src_path):
-                raise errors.FileExpected(src_path)
-            raise
-
-    def move(self, src_path, dst_path, overwrite=False):
-        self.copy(src_path, dst_path, overwrite=overwrite)
-        self.remove(src_path)
-
-    def geturl(self, path, purpose="download"):
+    def geturl(self, path, purpose="download", expires=1):
         _path = self.validatepath(path)
         _key = self._path_to_key(_path)
         if _path == "/":
             raise errors.NoURL(path, purpose)
         if purpose == "download":
-            url = self.client.generate_presigned_url(
-                ClientMethod="get_object",
-                Params={"Bucket": self._bucket_name, "Key": _key},
+            url = self.minio.presigned_get_object(
+                self._bucket_name,
+                _key,
+                expires=timedelta(days=1)
             )
             return url
         else:
