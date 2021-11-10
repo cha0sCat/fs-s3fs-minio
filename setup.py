@@ -20,7 +20,7 @@ CLASSIFIERS = [
 with open("README.rst", "rt") as f:
     DESCRIPTION = f.read()
 
-REQUIREMENTS = ["boto3~=1.9", "fs~=2.4", "six~=1.10"]
+REQUIREMENTS = ["minio", "fs~=2.4", "six~=1.10"]
 
 setup(
     name="fs-s3fs-minio",
