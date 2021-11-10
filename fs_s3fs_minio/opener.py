@@ -10,7 +10,7 @@ __all__ = ["S3FSOpener"]
 from fs.opener import Opener
 from fs.opener.errors import OpenerError
 
-from ._s3fs import S3FS
+from ._s3fs_minio import S3FS
 
 
 class S3FSOpener(Opener):

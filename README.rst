@@ -24,7 +24,7 @@ Open an S3FS by explicitly using the constructor:
 
 .. code:: python
 
-    from fs_s3fs import S3FS
+    from fs_s3fs_minio import S3FS
     s3fs = S3FS('mybucket')
 
 Or with a FS URL:

@@ -19,7 +19,8 @@ pip install fs-s3fs
 Open an S3FS by explicitly using the constructor:
 
 ```python
-from fs_s3fs import S3FS
+from fs_s3fs_minio import S3FS
+
 s3fs = S3FS('mybucket')
 ```
 
@@ -72,7 +73,7 @@ uploaded to a bucket:
 
 ```python
 import fs, fs.mirror
-s3fs = S3FS('example', upload_args={"CacheControl": "max-age=2592000", "ACL": "public-read"})
+s3fs = S3FS('example',)
 fs.mirror.mirror('/path/to/mirror', s3fs)
 ```
 
@@ -84,7 +85,7 @@ It is important to URL-Escape the `cache_control` value in a URL, as it may cont
 
 ```python
 import fs, fs.mirror
-with open fs.open_fs('s3://example?acl=public-read&cache_control=max-age%3D2592000%2Cpublic') as s3fs
+with open fs.open_fs('s3://example') as s3fs
     fs.mirror.mirror('/path/to/mirror', s3fs)
 ```
 

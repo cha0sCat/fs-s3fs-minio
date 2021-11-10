@@ -6,7 +6,7 @@ import minio
 from nose.plugins.attrib import attr
 
 from fs.test import FSTestCases
-from fs_s3fs import S3FS
+from fs_s3fs_minio import S3FS
 
 
 class TestS3FS(FSTestCases, unittest.TestCase):
