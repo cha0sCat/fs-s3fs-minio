@@ -38,13 +38,13 @@ is with an *opener*, which is a simple URL like syntax. Here is an example::
 For more granular control, you may import the S3FS class and construct
 it explicitly::
 
-    from fs_s3fs import S3FS
+    from fs_s3fs_minio import S3FS
     s3fs = S3FS('mybucket')
 
 S3FS Constructor
 ----------------
 
-.. autoclass:: fs_s3fs.S3FS
+.. autoclass:: fs_s3fs_minio.S3FS
     :members:
 
 

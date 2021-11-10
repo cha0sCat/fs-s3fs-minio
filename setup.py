@@ -2,7 +2,7 @@
 
 from setuptools import setup, find_packages
 
-with open("fs_s3fs/_version.py") as f:
+with open("fs_s3fs_minio/_version.py") as f:
     exec(f.read())
 
 CLASSIFIERS = [
@@ -23,9 +23,9 @@ with open("README.rst", "rt") as f:
 REQUIREMENTS = ["boto3~=1.9", "fs~=2.4", "six~=1.10"]
 
 setup(
-    name="fs-s3fs",
-    author="Will McGugan",
-    author_email="willmcgugan@gmail.com",
+    name="fs-s3fs-minio",
+    author="cha0sCat",
+    author_email="no@mail.com",
     classifiers=CLASSIFIERS,
     description="Amazon S3 filesystem for PyFilesystem2",
     install_requires=REQUIREMENTS,
@@ -35,7 +35,7 @@ setup(
     keywords=["pyfilesystem", "Amazon", "s3"],
     platforms=["any"],
     test_suite="nose.collector",
-    url="https://github.com/PyFilesystem/s3fs",
+    url="https://github.com/cha0sCat/fs-s3fs-minio",
     version=__version__,
-    entry_points={"fs.opener": ["s3 = fs_s3fs.opener:S3FSOpener"]},
+    entry_points={"fs.opener": ["s3 = fs_s3fs_minio.opener:S3FSOpener"]},
 )
